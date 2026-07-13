@@ -147,7 +147,9 @@ The only client is your game server, and **player-typed chat reaches the model a
 - **Keep `SHIM_HOST=127.0.0.1`** (the default) — loopback-only, so only local processes can reach it. If you must expose it on a LAN, put auth / a reverse proxy in front; the endpoint itself is unauthenticated.
 - **Running an uncensored model in front of strangers** (a semi-public server)? It will say more when jailbroken than a safety-tuned model would — moderate accordingly. On a solo/trusted server this is moot.
 
-Found something? Open an issue — good-faith pokes are welcome.
+The hardening in this section was prompted by a thoughtful prompt-injection review from
+**[@jstjep00](https://github.com/jstjep00)** — much appreciated. Found something else? Open an
+issue (or see [`SECURITY.md`](SECURITY.md)); good-faith pokes are welcome.
 
 ## Credits & license
 
