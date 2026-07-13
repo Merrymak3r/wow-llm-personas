@@ -1,7 +1,7 @@
 # wow-llm-personas
 
 A tiny (~230-line, **stdlib-only**) Python shim that gives [CMaNGOS](https://github.com/cmangos) +
-[playerbots](https://github.com/celguar/mangosbot-bots) AI playerbots real **personalities** by
+[playerbots](https://github.com/cmangos/playerbots) AI playerbots real **personalities** by
 routing their in-game "ai chat" through your **local [Ollama](https://ollama.com)**.
 
 Party bots roast you in character, remember the last few things you said, and banter with each
@@ -10,6 +10,21 @@ other — all on one consumer GPU, nothing leaving your LAN.
 > This is the shim behind [that r/homelab post] about ~1,800 vanilla-WoW bots with AI personalities.
 > The bots and the server are stock projects; **this repo is the glue that gives them a voice** —
 > the persona injection, the per-bot memory, and the bot-to-bot banter tuning.
+
+## Prerequisites
+
+This shim only handles the *personality* layer — you need a working **CMaNGOS 1.12 + playerbots**
+server first (the one with the native LLM-chat hook). The fastest path, and the one I used, is the
+prebuilt **Eluna-CMaNGOS-Classic** Windows builds, which bundle the bots, Eluna, and the extractors:
+
+- **Core (prebuilt, easiest):** [Eluna-Ports/Eluna-CMaNGOS-Classic](https://github.com/Eluna-Ports/Eluna-CMaNGOS-Classic) — grab a `with-all` build
+- **Playerbots module:** [cmangos/playerbots](https://github.com/cmangos/playerbots)
+- **World database:** [cmangos/classic-db](https://github.com/cmangos/classic-db)
+- **LLM runtime:** [Ollama](https://ollama.com), with a model pulled
+
+You supply your own 1.12 game client — this repo distributes no game data and links to none. Once your
+bots chat *at all* server-side, point `AiPlayerbot.LLMApiEndpoint` at this shim and you're set (see
+[Quick start](#quick-start)).
 
 ## How it works
 
@@ -121,5 +136,5 @@ Bring your own cast — they're just text files.
 ## Credits & license
 
 Built on the excellent [CMaNGOS](https://github.com/cmangos) core and the
-[playerbots](https://github.com/celguar/mangosbot-bots) module, served by [Ollama](https://ollama.com).
+[playerbots](https://github.com/cmangos/playerbots) module, served by [Ollama](https://ollama.com).
 This shim is just the persona/memory/banter layer on top. MIT — see [LICENSE](LICENSE).
