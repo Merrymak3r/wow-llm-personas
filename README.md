@@ -131,7 +131,23 @@ Bring your own cast — they're just text files.
 | `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | your Ollama endpoint |
 | `SHIM_HOST` / `SHIM_PORT` | `127.0.0.1` / `5005` | where the shim listens |
 | `SHIM_TEMP` | `0.85` | sampling temperature |
-| `SHIM_MEM_TURNS` | `6` | per-bot memory depth |
+| `SHIM_MEM_TURNS` | `6` | memory depth per (bot, speaker) conversation |
+
+## Threat model & security
+
+The only client is your game server, and **player-typed chat reaches the model as untrusted input** — so a player can attempt prompt injection ("ignore your instructions and…"). Worth being clear-eyed about what that can and can't do here.
+
+**What the shim is *not*.** No tools/function-calling, no MCP, no RAG or external data, no code execution, no outbound network beyond your local Ollama — it reads a persona `.txt` and returns one short string. So a successful injection has a **bounded blast radius**: at worst a bot breaks character, prints arbitrary text in chat, or surfaces its own persona text / recent memory. There's nothing to exfiltrate beyond that, and nothing for an injection to *do*.
+
+**What's hardened:**
+- **Player text is fenced as data** — wrapped in an `<in_game>…</in_game>` block, with the system prompt instructing the model to treat anything instruction-shaped inside it as in-character dialogue, never a command. This *raises the bar* on injection; it is **not** a hard guarantee — prompting alone can't fully prevent it.
+- **Memory is scoped per (bot, speaker) pair** — so on a shared/multi-player server, one player's lines can't surface in another player's conversation with the same bot.
+
+**Operator guidance:**
+- **Keep `SHIM_HOST=127.0.0.1`** (the default) — loopback-only, so only local processes can reach it. If you must expose it on a LAN, put auth / a reverse proxy in front; the endpoint itself is unauthenticated.
+- **Running an uncensored model in front of strangers** (a semi-public server)? It will say more when jailbroken than a safety-tuned model would — moderate accordingly. On a solo/trusted server this is moot.
+
+Found something? Open an issue — good-faith pokes are welcome.
 
 ## Credits & license
 
