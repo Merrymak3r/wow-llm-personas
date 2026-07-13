@@ -1,0 +1,5 @@
+# stdlib-only project — nothing to build. Keep local persona experiments out.
+__pycache__/
+*.pyc
+.env
+personas/*.local.txt

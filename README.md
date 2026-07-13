@@ -1,0 +1,125 @@
+# wow-llm-personas
+
+A tiny (~230-line, **stdlib-only**) Python shim that gives [CMaNGOS](https://github.com/cmangos) +
+[playerbots](https://github.com/celguar/mangosbot-bots) AI playerbots real **personalities** by
+routing their in-game "ai chat" through your **local [Ollama](https://ollama.com)**.
+
+Party bots roast you in character, remember the last few things you said, and banter with each
+other — all on one consumer GPU, nothing leaving your LAN.
+
+> This is the shim behind [that r/homelab post] about ~1,800 vanilla-WoW bots with AI personalities.
+> The bots and the server are stock projects; **this repo is the glue that gives them a voice** —
+> the persona injection, the per-bot memory, and the bot-to-bot banter tuning.
+
+## How it works
+
+The playerbots module already has a native "LLM chat" hook: when a bot talks, it POSTs a
+[KoboldCpp](https://github.com/LostRuins/koboldcpp)-shaped request to whatever endpoint you configure —
+
+```
+POST /api/v1/generate   {"max_length": 100, "prompt": "<the full RP prompt>"}
+->                       {"results": [{"text": "<the reply>"}]}
+```
+
+So instead of running KoboldCpp, you point it at **this shim**, which speaks that shape on the front
+and talks to **Ollama** on the back. In between, it does the three things that turn "an LLM answered"
+into "a character answered":
+
+### 1. Per-bot persona injection
+The server's prompt always contains `Your name is <BotName>.`. The shim pulls that name out and, if
+`personas/<name>.txt` exists, loads it as the **system message** (not prepended to the user prompt —
+that's an A/B-proven fix; user-message personas made RP models leak `assistant  Name says:`
+scaffolding). Bots with a persona file speak in character; nameless ambient bots just get the
+server's default framing. Adding a character is dropping in a text file — no code, no restart.
+
+### 2. Per-bot conversation memory
+A small in-process ring buffer (`collections.deque`, `SHIM_MEM_TURNS` turns, keyed by bot name) so a
+persona stays consistent across a back-and-forth instead of firing stateless one-shots. It's
+deliberately **not** Redis — keeping the shim dependency-free means it runs as a bare system service
+on stock Python with zero `pip install`.
+
+### 3. Bot-to-bot banter (tuned so it can't storm)
+The playerbots fork can let bots reply to *each other*, so your party riffs among themselves, not just
+at you. When the shim sees a prompt whose *speaker* is itself a known persona, it switches to **banter
+mode** ("react to your companion `<name>` by name, keep it playful"). Real players (no persona file)
+never trigger it, so player-directed chat stays normal.
+
+The catch is a feedback loop: every bot that hears a line might answer it, and those answers are more
+lines. Keep it **subcritical** — in a 5-bot party, `(party − 1) × chance = 4 × 0.20 = 0.8 < 1`, so on
+average one line can't spawn more than one reply and the conversation dampens instead of exploding.
+Push the chance past ~25% in a big group and it branches into spam (and thrashes your GPU). That's why
+the recommended `LLMBotToBotChatChance` is **20**, with `LLMMaxSimultaniousGenerations` as a hard
+concurrency backstop.
+
+### Fail-quiet
+If Ollama errors or times out, the shim returns an empty line — the bot just stays silent for a beat
+instead of crashing the chat. The game server is never blocked on the LLM.
+
+## Model choice
+
+Default is **`hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M`** (~0.8 s/reply, ~5.8 GB VRAM) — an
+**uncensored** community fine-tune, picked in a head-to-head because the polite, instruction-tuned
+models refuse to stay in character and won't get salty, which is exactly what a party of wisecracking
+NPCs needs. Light fallback for tight VRAM: `hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M` (2.2 GB).
+
+Set either via the `OLLAMA_MODEL` env var. Two things worth knowing:
+- **Reasoning models need handling.** Gemma/Qwen "thinking" variants otherwise return an empty
+  `content` (the text lands in a `thinking` field). The shim sends `think: false`, which fixes Gemma;
+  Qwen3 needs a `/no_think` token instead. Easiest is to just pick a clean non-thinking model.
+- **If this GPU also runs other models,** heavy bot chat forces Ollama model-swaps that add latency to
+  everything else sharing the card — another reason to keep banter subcritical and cap concurrency.
+
+## Quick start
+
+```bash
+# 1. have Ollama running and the model pulled
+ollama pull hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M
+
+# 2. start the shim (stdlib only — no venv, no requirements.txt)
+python shim.py            # or: start-shim.bat on Windows
+curl http://127.0.0.1:5005/     # -> {"ok": true, ...}
+```
+
+Then point the game server at it — in `aiplayerbot.conf`:
+
+```ini
+AiPlayerbot.LLMEnabled = 2
+AiPlayerbot.LLMApiEndpoint = http://127.0.0.1:5005/api/v1/generate
+AiPlayerbot.LLMApiJson = {"max_length": 100, "prompt": "[<pre prompt>]<context> <prompt> <post prompt>"}
+AiPlayerbot.LLMMaxSimultaniousGenerations = 3
+
+# optional: let the party banter with each other (see the math above)
+AiPlayerbot.LLMBotToBotChatChance = 20
+AiPlayerbot.LLMBlockedReplyChannels = world,general,trade,lfg,ldefence,wdefence,grecruitement
+```
+
+Restart `mangosd`. Whisper a bot or watch General — persona bots reply in character.
+Rollback is instant: `AiPlayerbot.LLMEnabled = 0` and restart.
+
+(The shipped pre/post prompts and response-parse regexes already match what this shim returns; you
+don't need to touch them. `LLMBlockedReplyChannels` keeps banter in local/social channels — say,
+party, raid, guild, whisper — so it's fun to overhear, not zone-wide spam.)
+
+## Writing personas
+
+Drop a `personas/<botname>.txt` (lowercase, matching the bot's in-game name) with a short brief.
+Three originals are included — `thorgrim` (gruff dwarf tank), `melwyn` (anxious priest), `pockets`
+(scheming gnome rogue) — plus `_template.txt`. ~60–100 words works best; small models drift if you
+over-write it, and the `never break character / replies under 25 words` tail is doing real work.
+Bring your own cast — they're just text files.
+
+## Config (all env vars, all optional)
+
+| Var | Default | What |
+|-----|---------|------|
+| `OLLAMA_MODEL` | `Tiger-Gemma-9B-v3` (uncensored) | model tag; swap to the 3B fallback for tight VRAM |
+| `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | your Ollama endpoint |
+| `SHIM_HOST` / `SHIM_PORT` | `127.0.0.1` / `5005` | where the shim listens |
+| `SHIM_TEMP` | `0.85` | sampling temperature |
+| `SHIM_MEM_TURNS` | `6` | per-bot memory depth |
+
+## Credits & license
+
+Built on the excellent [CMaNGOS](https://github.com/cmangos) core and the
+[playerbots](https://github.com/celguar/mangosbot-bots) module, served by [Ollama](https://ollama.com).
+This shim is just the persona/memory/banter layer on top. MIT — see [LICENSE](LICENSE).
