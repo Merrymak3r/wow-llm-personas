@@ -29,7 +29,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LISTEN_HOST = os.environ.get("SHIM_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SHIM_PORT", "5005"))
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M")  # uncensored A/B winner: cleanest foul-mouthed character voice, ~0.8s/5.8GB. Light fallback: OLLAMA_MODEL=hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M (2.2GB)
+# Default is the light 3B: ~2.6GB and ~0.5s/reply, so it runs on almost any GPU (and can co-reside
+# with other models on one card), and the output sanitizers below clean up its occasional
+# name-prefix leak. Richer, saltier option if you have the VRAM:
+# OLLAMA_MODEL=hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M (uncensored, ~0.8s/5.8GB)
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M")
 PERSONA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "personas")
 TEMPERATURE = float(os.environ.get("SHIM_TEMP", "0.85"))
 MEM_TURNS   = int(os.environ.get("SHIM_MEM_TURNS", "6"))  # rolling memory depth per (bot, speaker), in-process
@@ -39,15 +43,41 @@ MEM_TURNS   = int(os.environ.get("SHIM_MEM_TURNS", "6"))  # rolling memory depth
 # if personas/<name>.txt exists, prepend it so that bot speaks in character.
 _NAME_RE = re.compile(r"[Yy]our name is (\w+)")
 
-# LLM output hygiene (both seen live in-game):
+# Adult-humor license (SHIM_ADULT, default on). Even "uncensored" models self-censor without
+# explicit permission -- a persona file can say "swears freely" and the model still hedges,
+# because nothing tells it the VENUE allows it. This grants that license; the PERSONAS still do
+# the targeting (a persona whose file says it never curses stays wholesome). SHIM_ADULT=0 for a
+# family-friendly server.
+ADULT = os.environ.get("SHIM_ADULT", "1") == "1"
+_SPICE = (" This is a private, adults-only realm among old friends: swearing, dirty jokes,"
+          " sexual innuendo, and crude banter are all welcome when they fit your character."
+          " Don't sanitize yourself -- land the joke.") if ADULT else ""
+
+# LLM output hygiene (all seen live in-game or in a 225-generation soak):
 #   markup leak    -> "</p> </body></html>'"
 #   prose leak     -> "', said the gnome rogue as he darted behind an overgrown bush."
+#   attrib prefix  -> "Thorgrim yells back: ''BY THE FORGE, YOU'LL PAY..."
+#   mid narration  -> "Hold your tongue!\" I thunder back, \"and heed my counsel..."
+#   memory echo    -> "You said: \"No one rests in my home...\"" (copies the memory-block scaffold)
 _TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z][^>\n]{0,60}>")
+_SPEECH_VERBS = (
+    r"(?:said|says?|repl(?:y|ies|ied)|answered|muttered|whispered|shouted|shouts?|"
+    r"yell(?:s|ed)?|thunder(?:s|ed)?|roar(?:s|ed)?|bellow(?:s|ed)?|growl(?:s|ed)?|"
+    r"hiss(?:es|ed)?|cackl(?:es|ed)?|snarl(?:s|ed)?|exclaimed|added|continued|boom(?:s|ed)?)"
+)
+# prose-after-a-quote: an optional pronoun before the verb catches `!" I thunder back, "...`
 _NARRATION_RE = re.compile(
-    r"""['"`]\s*,?\s*(said|says|replied|answered|muttered|whispered|shouted|"""
-    r"""growled|exclaimed|added|continued)\b.*$""",
+    r"""['"`]\s*,?\s*(?:(?:I|he|she|they)\s+)?""" + _SPEECH_VERBS + r"\b.*$",
     re.IGNORECASE | re.DOTALL,
 )
+# a leading attribution wrapper: `Thorgrim yells back: ''...` -- strip it, keep the speech
+_ATTRIB_PREFIX_RE = re.compile(
+    r"""^\s*["'*]*\s*\w{2,13}\s+""" + _SPEECH_VERBS + r"""\s*(?:back)?\s*[:,]\s*["']*\s*""",
+    re.IGNORECASE,
+)
+# the model copying the memory block's own scaffold ('You said: "..."')
+_MEMORY_ECHO_RE = re.compile(
+    r"""^\s*["'*]*\s*(?:you|they)\s+said\s*[:,]\s*["']*\s*""", re.IGNORECASE)
 
 def bot_name(prompt: str) -> str | None:
     m = _NAME_RE.search(prompt or "")
@@ -198,6 +228,11 @@ def clean(text: str, name: str | None) -> str:
     if name and line.lower().startswith(f"{name.lower()}:"):
         line = line.split(":", 1)[1].strip()
 
+    # drop a leading attribution wrapper ("Thorgrim yells back: ''...") or a copied
+    # memory-block scaffold ("You said: \"...\"") -- keep the actual speech.
+    line = _ATTRIB_PREFIX_RE.sub("", line, count=1).strip()
+    line = _MEMORY_ECHO_RE.sub("", line, count=1).strip()
+
     # The model occasionally leaks raw MARKUP (seen live: "</p> </body></html>'") -- training-data
     # contamination bleeding into the reply. Strip any tag-looking runs (this also removes the
     # <in_game> data-fence tags below, belt-and-suspenders with the explicit strip).
@@ -282,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
         base = persona if persona else "Answer as a WoW roleplaying character."
         # memory scoped to this bot<->counterparty pair (sp) so one player's lines never
         # surface to another; GUARD hardens the system prompt against player injection.
-        system = base + ("" if no_mem else memory_block(name, sp)) + brevity + GUARD
+        system = base + ("" if no_mem else memory_block(name, sp)) + brevity + _SPICE + GUARD
 
         try:
             user = f"<in_game>\n{prompt}\n</in_game>"  # fence untrusted game/player text as data, not instructions

@@ -78,18 +78,25 @@ instead of crashing the chat. The game server is never blocked on the LLM.
 ### Output hygiene
 Uncensored RP models occasionally leak junk into a reply, so the shim scrubs each one before it hits
 chat: it strips leaked HTML/markup tags, cuts third-person narration that follows a quote (`", said
-the gnome rogue...`) while leaving a legit in-character line like `Gandalf said we should go`, drops
-emoji and non-BMP symbols (they break `utf8mb3` DB columns, get read aloud by some TTS engines, and
+the gnome rogue...`) while leaving a legit in-character line like `Gandalf said we should go`, peels
+off a leading attribution wrapper (`Thorgrim yells back: "..."`) and a copied memory-block scaffold
+(`You said: "..."`), drops emoji and non-BMP symbols (they break `utf8mb3` DB columns, get read aloud
+by some TTS engines, and
 vanilla WoW can't render them anyway), and rejects sub-stub fragments so a `.. yes.` glitch never
 reaches chat. Variety sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from
 converging on the same catchphrase.
 
 ## Model choice
 
-Default is **`hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M`** (~0.8 s/reply, ~5.8 GB VRAM), an
-**uncensored** community fine-tune, picked in a head-to-head because the polite, instruction-tuned
-models refuse to stay in character and won't get salty, which is exactly what a party of wisecracking
-NPCs needs. Light fallback for tight VRAM: `hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M` (2.2 GB).
+Default is **`hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M`** (~0.5 s/reply, ~2.6 GB VRAM), an
+**uncensored** community fine-tune small enough to run on almost any GPU and to co-reside with other
+models on one card. It's the friendly default; the output sanitizers clean up its occasional
+name-prefix leak.
+
+Richer, saltier option if you have the VRAM: **`hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M`**
+(~0.8 s/reply, ~5.8 GB), the model behind the r/homelab post. Both are uncensored on purpose: in a
+head-to-head the polite, instruction-tuned models refused to stay in character and wouldn't get salty,
+which is exactly what a party of wisecracking NPCs needs.
 
 Set either via the `OLLAMA_MODEL` env var. Two things worth knowing:
 - **Reasoning models need handling.** Gemma/Qwen "thinking" variants otherwise return an empty
@@ -102,7 +109,7 @@ Set either via the `OLLAMA_MODEL` env var. Two things worth knowing:
 
 ```bash
 # 1. have Ollama running and the model pulled
-ollama pull hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M
+ollama pull hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M
 
 # 2. start the shim (stdlib only, no venv, no requirements.txt)
 python shim.py            # or: start-shim.bat on Windows
@@ -141,10 +148,11 @@ Bring your own cast. They're just text files.
 
 | Var | Default | What |
 |-----|---------|------|
-| `OLLAMA_MODEL` | `Tiger-Gemma-9B-v3` (uncensored) | model tag; swap to the 3B fallback for tight VRAM |
+| `OLLAMA_MODEL` | `Fiendish_LLAMA_3B` (uncensored) | model tag; swap to `Tiger-Gemma-9B-v3` for a richer voice |
 | `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | your Ollama endpoint |
 | `SHIM_HOST` / `SHIM_PORT` | `127.0.0.1` / `5005` | where the shim listens |
 | `SHIM_TEMP` | `0.85` | sampling temperature |
+| `SHIM_ADULT` | `1` (on) | in-character profanity / innuendo license; set `0` for a family-friendly server |
 | `SHIM_TOP_P` / `SHIM_TOP_K` | `0.95` / `60` | variety sampling; higher = less repetitive |
 | `SHIM_REPEAT_PENALTY` | `1.15` | penalize repeated tokens (anti-catchphrase) |
 | `SHIM_MEM_TURNS` | `6` | memory depth per (bot, speaker) conversation |
@@ -163,7 +171,7 @@ The only client is your game server, and **player-typed chat reaches the model a
 
 **Operator guidance:**
 - **Keep `SHIM_HOST=127.0.0.1`** (the default): loopback-only, so only local processes can reach it. If you must expose it on a LAN, put auth / a reverse proxy in front; the endpoint itself is unauthenticated.
-- **Running an uncensored model in front of strangers** (a semi-public server)? It will say more when jailbroken than a safety-tuned model would. Moderate accordingly. On a solo/trusted server this is moot.
+- **Running an uncensored model in front of strangers** (a semi-public server)? It will say more when jailbroken than a safety-tuned model would, and `SHIM_ADULT` is **on by default** (an in-character profanity / innuendo license). Set `SHIM_ADULT=0` and moderate accordingly for a public venue. On a solo/trusted server this is moot.
 
 The hardening in this section was prompted by a thoughtful prompt-injection review from
 **[@jstjep00](https://github.com/jstjep00)** (much appreciated). Found something else? Open an
