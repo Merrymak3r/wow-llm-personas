@@ -32,12 +32,22 @@ OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "hf.co/TheDrummer/Tiger-Gemma-9B-v3-GGUF:Q4_K_M")  # uncensored A/B winner: cleanest foul-mouthed character voice, ~0.8s/5.8GB. Light fallback: OLLAMA_MODEL=hf.co/mradermacher/Fiendish_LLAMA_3B-GGUF:Q4_K_M (2.2GB)
 PERSONA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "personas")
 TEMPERATURE = float(os.environ.get("SHIM_TEMP", "0.85"))
-MEM_TURNS   = int(os.environ.get("SHIM_MEM_TURNS", "6"))  # per-bot rolling conversation memory (in-process)
+MEM_TURNS   = int(os.environ.get("SHIM_MEM_TURNS", "6"))  # rolling memory depth per (bot, speaker), in-process
 
 # ---- persona lookup -----------------------------------------------------------
 # The server's pre-prompt contains "Your name is <bot name>." -- pull it out and,
 # if personas/<name>.txt exists, prepend it so that bot speaks in character.
 _NAME_RE = re.compile(r"[Yy]our name is (\w+)")
+
+# LLM output hygiene (both seen live in-game):
+#   markup leak    -> "</p> </body></html>'"
+#   prose leak     -> "', said the gnome rogue as he darted behind an overgrown bush."
+_TAG_RE = re.compile(r"<\s*/?\s*[A-Za-z][^>\n]{0,60}>")
+_NARRATION_RE = re.compile(
+    r"""['"`]\s*,?\s*(said|says|replied|answered|muttered|whispered|shouted|"""
+    r"""growled|exclaimed|added|continued)\b.*$""",
+    re.IGNORECASE | re.DOTALL,
+)
 
 def bot_name(prompt: str) -> str | None:
     m = _NAME_RE.search(prompt or "")
@@ -77,14 +87,14 @@ def speaker_name(prompt: str, responder: str | None) -> str | None:
         pass
     return None
 
-# ---- per-bot conversation memory ----------------------------------------------
-# In-process ring buffer (stdlib deque) keyed by bot name, so a persona remembers
-# its last few exchanges and stays consistent instead of firing stateless one-shots.
-# Deliberately NOT Redis: the shim stays dependency-free so it can run as a bare
-# system service on stock Python with no site-packages.
+# ---- conversation memory ------------------------------------------------------
+# In-process ring buffer (stdlib deque) keyed by (bot_name, counterparty), so a persona
+# remembers its last few exchanges and stays consistent instead of firing stateless
+# one-shots -- and scoped to a bot<->speaker pair, NOT global per bot, so one player's
+# lines can never surface in another player's conversation with the same bot.
+# Deliberately NOT Redis: the shim stays dependency-free so it can run as a bare system
+# service on stock Python with no site-packages.
 _MEM_LOCK = threading.Lock()
-# Keyed by (bot_name, counterparty) -- scoped to a bot<->speaker pair, NOT global
-# per bot -- so one player's lines can never surface in another player's conversation.
 _MEMORY: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=MEM_TURNS))
 
 def _mem_key(name: str, speaker: str | None) -> tuple:
@@ -144,6 +154,10 @@ def ask_ollama(system: str, user: str, max_tokens: int) -> str:
         "options": {
             "num_predict": max(24, min(max_tokens, 160)),
             "temperature": TEMPERATURE,
+            # keep replies from converging on the same catchphrase every time
+            "top_p": float(os.environ.get("SHIM_TOP_P", "0.95")),
+            "top_k": int(os.environ.get("SHIM_TOP_K", "60")),
+            "repeat_penalty": float(os.environ.get("SHIM_REPEAT_PENALTY", "1.15")),
         },
     }).encode()
     req = urllib.request.Request(OLLAMA_URL, data=body,
@@ -153,9 +167,29 @@ def ask_ollama(system: str, user: str, max_tokens: int) -> str:
     return (data.get("message", {}).get("content") or "").strip()
 
 # ---- one-line reply cleanup ---------------------------------------------------
-# The bot's chat is one short line; strip role labels / newlines the model may add.
+def strip_unsafe(s: str) -> str:
+    """Drop emoji/symbols. Two real bugs this prevents:
+      1. Many DBs store chat in utf8mb3 columns -- a 4-byte (non-BMP) emoji makes the
+         write FAIL; if a caller persists the reply, the row sticks and retries forever.
+      2. TTS engines (e.g. Piper) read a symbol's NAME aloud -- a bot literally said
+         "exclamation point".
+    Vanilla WoW can't render emoji anyway. Normal text (accents, em-dash) is preserved.
+    """
+    out = []
+    for ch in (s or ""):
+        o = ord(ch)
+        if o > 0xFFFF:                              # non-BMP (most emoji)
+            continue
+        if 0x2600 <= o <= 0x27BF:                   # misc symbols + dingbats (incl. warning/exclamation)
+            continue
+        if 0xFE00 <= o <= 0xFE0F or o == 0x200D:    # variation selectors / ZWJ
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def clean(text: str, name: str | None) -> str:
-    text = (text or "").strip()
+    text = strip_unsafe(text or "").strip()
     # first NON-empty line (models often lead with a blank line)
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     if not line:
@@ -163,9 +197,32 @@ def clean(text: str, name: str | None) -> str:
     # drop an echoed "Name:" prefix and any wrapping quotes/asterisks
     if name and line.lower().startswith(f"{name.lower()}:"):
         line = line.split(":", 1)[1].strip()
-    line = line.strip('"').strip("*").strip()
-    # defensive: never let the data-fence tags leak into visible bot chat
+
+    # The model occasionally leaks raw MARKUP (seen live: "</p> </body></html>'") -- training-data
+    # contamination bleeding into the reply. Strip any tag-looking runs (this also removes the
+    # <in_game> data-fence tags below, belt-and-suspenders with the explicit strip).
+    line = _TAG_RE.sub("", line).strip()
+
+    # ...and sometimes it writes PROSE instead of dialogue, e.g.
+    #   ', said the gnome rogue as he darted behind an overgrown bush.'
+    # Cut third-person attribution, but only when it follows a quote mark, so a legitimate
+    # in-character line like `Gandalf said we should go` survives.
+    line = _NARRATION_RE.sub("", line).strip()
+
+    # defensive: never let the data-fence tags (see GUARD) leak into visible bot chat
     line = line.replace("<in_game>", "").replace("</in_game>", "").strip()
+
+    line = line.strip('"').strip("'").strip("*").strip()
+
+    # A name-strip upstream can leave a dangling ", you should try..." -- drop orphan
+    # leading punctuation so lines don't start mid-sentence.
+    line = line.lstrip(",;:-–— ").strip()
+
+    # Reject stubs. The model sometimes emits fragments (".. yes.", "They") which look like
+    # glitches in chat. Require a bit of substance: >=8 chars AND at least two words.
+    if len(line) < 8 or len(line.split()) < 2:
+        return ""
+
     return line[:230]  # bot chat is capped; keep it tight
 
 # ---- prompt-injection guard ---------------------------------------------------
@@ -206,6 +263,11 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt = req.get("prompt", "")
         max_len = int(req.get("max_length", 100))
+        # no_memory: for ONE-SHOT callers (e.g. an event-driven "react to this" fired once).
+        # Memory is great for a conversation, but for a one-shot it feeds the model its own
+        # previous reply and it just COPIES it -- measured 2/5 unique with memory vs 5/5
+        # without. So one-shot callers opt out; in-game chat/banter keeps memory.
+        no_mem = bool(req.get("no_memory"))
         name = bot_name(prompt)
         persona = persona_for(name)
         sp = speaker_name(prompt, name)  # who this bot is replying to (player or bot), best-effort
@@ -220,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         base = persona if persona else "Answer as a WoW roleplaying character."
         # memory scoped to this bot<->counterparty pair (sp) so one player's lines never
         # surface to another; GUARD hardens the system prompt against player injection.
-        system = base + memory_block(name, sp) + brevity + GUARD
+        system = base + ("" if no_mem else memory_block(name, sp)) + brevity + GUARD
 
         try:
             user = f"<in_game>\n{prompt}\n</in_game>"  # fence untrusted game/player text as data, not instructions
@@ -230,7 +292,8 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"[shim] ollama error: {e}\n")
             return self._json(200, {"results": [{"text": ""}]})  # fail quiet: bot just stays silent
 
-        remember(name, sp, _incoming_line(prompt, name), reply)  # store this exchange for continuity
+        if not no_mem:
+            remember(name, sp, _incoming_line(prompt, name), reply)  # continuity for conversations only
 
         tag = f"{name}{' *persona*' if persona else ''}" if name else "?"
         if companion:

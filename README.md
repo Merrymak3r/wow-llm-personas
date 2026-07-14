@@ -47,11 +47,16 @@ that's an A/B-proven fix; user-message personas made RP models leak `assistant  
 scaffolding). Bots with a persona file speak in character; nameless ambient bots just get the
 server's default framing. Adding a character is dropping in a text file. No code, no restart.
 
-### 2. Per-bot conversation memory
-A small in-process ring buffer (`collections.deque`, `SHIM_MEM_TURNS` turns, keyed by bot name) so a
-persona stays consistent across a back-and-forth instead of firing stateless one-shots. It's
-deliberately **not** Redis: keeping the shim dependency-free means it runs as a bare system service
-on stock Python with zero `pip install`.
+### 2. Per-conversation memory
+A small in-process ring buffer (`collections.deque`, `SHIM_MEM_TURNS` turns) so a persona stays
+consistent across a back-and-forth instead of firing stateless one-shots. It's keyed per
+`(bot, speaker)` pair, not globally per bot, so on a shared server one player's lines never surface in
+another player's conversation with the same bot. Deliberately **not** Redis: keeping the shim
+dependency-free means it runs as a bare system service on stock Python with zero `pip install`.
+
+A request can set `"no_memory": true` to opt a single reply out of memory, both read and write. Use it
+for one-shot calls, like an event-driven "react to this" that fires once: memory helps a conversation,
+but for a one-shot it just feeds the model its own last reply and it copies it verbatim.
 
 ### 3. Bot-to-bot banter (tuned so it can't storm)
 The playerbots fork can let bots reply to *each other*, so your party riffs among themselves, not just
@@ -69,6 +74,15 @@ concurrency backstop.
 ### Fail-quiet
 If Ollama errors or times out, the shim returns an empty line. The bot just stays silent for a beat
 instead of crashing the chat. The game server is never blocked on the LLM.
+
+### Output hygiene
+Uncensored RP models occasionally leak junk into a reply, so the shim scrubs each one before it hits
+chat: it strips leaked HTML/markup tags, cuts third-person narration that follows a quote (`", said
+the gnome rogue...`) while leaving a legit in-character line like `Gandalf said we should go`, drops
+emoji and non-BMP symbols (they break `utf8mb3` DB columns, get read aloud by some TTS engines, and
+vanilla WoW can't render them anyway), and rejects sub-stub fragments so a `.. yes.` glitch never
+reaches chat. Variety sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from
+converging on the same catchphrase.
 
 ## Model choice
 
@@ -131,7 +145,11 @@ Bring your own cast. They're just text files.
 | `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | your Ollama endpoint |
 | `SHIM_HOST` / `SHIM_PORT` | `127.0.0.1` / `5005` | where the shim listens |
 | `SHIM_TEMP` | `0.85` | sampling temperature |
+| `SHIM_TOP_P` / `SHIM_TOP_K` | `0.95` / `60` | variety sampling; higher = less repetitive |
+| `SHIM_REPEAT_PENALTY` | `1.15` | penalize repeated tokens (anti-catchphrase) |
 | `SHIM_MEM_TURNS` | `6` | memory depth per (bot, speaker) conversation |
+
+(`no_memory` is a per-request JSON field, not an env var; see Per-conversation memory above.)
 
 ## Threat model & security
 
