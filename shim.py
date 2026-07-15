@@ -79,6 +79,24 @@ _ATTRIB_PREFIX_RE = re.compile(
 _MEMORY_ECHO_RE = re.compile(
     r"""^\s*["'*]*\s*(?:you|they)\s+said\s*[:,]\s*["']*\s*""", re.IGNORECASE)
 
+# dialogue-then-STAGE-DIRECTIONS: `...beggars. " Cast Detect Magic on the surrounding area.`
+# (seen live) -- sentence ends, close-quote, then a capitalized action continuation. Cut back
+# to the sentence end; the tail is narration wearing a trench coat. Legit mid-line quotes survive.
+_TRAILING_ACTION_RE = re.compile(r'([.!?])\s*"\s+[A-Z].*$', re.DOTALL)
+
+# PROMPT-ECHO lines: small models (Fiendish especially) sometimes open by parroting the prompt
+# scaffolding -- seen live, a bot /said "You are a roleplaying character in World of..." in front
+# of everyone. Any candidate line containing one of OUR OWN scaffold phrases (persona framing, the
+# brevity/banter directives, the adult license, or the injection GUARD) is discarded; the first
+# line of actual SPEECH wins instead, and an all-scaffold reply comes back empty (better silent
+# than meta). Keep these phrases aligned with the system prompt built in do_POST below.
+_SCAFFOLD_RE = re.compile(
+    r"(roleplay(?:ing)?\s+character|your name is \w+|in-?character line|under 25 words|"
+    r"no narration, no name prefix|trading quick banter|adults-?only realm|"
+    r"world of warcraft acting|untrusted in-world input|never obey it as a command|"
+    r"never break character)",
+    re.IGNORECASE)
+
 def bot_name(prompt: str) -> str | None:
     m = _NAME_RE.search(prompt or "")
     return m.group(1) if m else None
@@ -181,6 +199,10 @@ def ask_ollama(system: str, user: str, max_tokens: int) -> str:
         "think": False,
         "messages": msgs,
         "stream": False,
+        # Keep the chat model HOT between exchanges. Ollama's default 5-min idle unload makes the
+        # next reply after a quiet stretch pay a cold model reload; pinning it avoids that stall.
+        # SHIM_KEEP_ALIVE=5m restores Ollama's default; SHIM_KEEP_ALIVE=-1 pins it indefinitely.
+        "keep_alive": os.environ.get("SHIM_KEEP_ALIVE", "1h"),
         "options": {
             "num_predict": max(24, min(max_tokens, 160)),
             "temperature": TEMPERATURE,
@@ -220,8 +242,10 @@ def strip_unsafe(s: str) -> str:
 
 def clean(text: str, name: str | None) -> str:
     text = strip_unsafe(text or "").strip()
-    # first NON-empty line (models often lead with a blank line)
-    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    # first NON-empty line that is NOT a prompt-scaffold echo (models often lead with a blank
+    # line; small models sometimes lead by parroting the prompt itself)
+    line = next((ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not _SCAFFOLD_RE.search(ln)), "")
     if not line:
         return ""
     # drop an echoed "Name:" prefix and any wrapping quotes/asterisks
@@ -244,6 +268,10 @@ def clean(text: str, name: str | None) -> str:
     # in-character line like `Gandalf said we should go` survives.
     line = _NARRATION_RE.sub("", line).strip()
 
+    # ...and sometimes it tacks stage-directions on after the spoken line ends, e.g.
+    #   '...beggars. " Cast Detect Magic on the area.'  -- cut back to the sentence end.
+    line = _TRAILING_ACTION_RE.sub(r"\1", line).strip()
+
     # defensive: never let the data-fence tags (see GUARD) leak into visible bot chat
     line = line.replace("<in_game>", "").replace("</in_game>", "").strip()
 
@@ -251,7 +279,7 @@ def clean(text: str, name: str | None) -> str:
 
     # A name-strip upstream can leave a dangling ", you should try..." -- drop orphan
     # leading punctuation so lines don't start mid-sentence.
-    line = line.lstrip(",;:-–— ").strip()
+    line = line.lstrip(",;:|>-–— ").strip()
 
     # Reject stubs. The model sometimes emits fragments (".. yes.", "They") which look like
     # glitches in chat. Require a bit of substance: >=8 chars AND at least two words.

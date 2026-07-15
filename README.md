@@ -83,8 +83,11 @@ off a leading attribution wrapper (`Thorgrim yells back: "..."`) and a copied me
 (`You said: "..."`), drops emoji and non-BMP symbols (they break `utf8mb3` DB columns, get read aloud
 by some TTS engines, and
 vanilla WoW can't render them anyway), and rejects sub-stub fragments so a `.. yes.` glitch never
-reaches chat. Variety sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from
-converging on the same catchphrase.
+reaches chat. It also drops a line that just parrots the prompt scaffolding (small models sometimes
+open by reciting `You are a roleplaying character...` straight into /say) and trims stage-directions
+tacked on after the spoken line ends (`"...beggars." Cast Detect Magic on the area.`). Variety
+sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from converging on the same
+catchphrase.
 
 ## Model choice
 
@@ -136,6 +139,16 @@ Rollback is instant: `AiPlayerbot.LLMEnabled = 0` and restart.
 don't need to touch them. `LLMBlockedReplyChannels` keeps banter in local/social channels: say,
 party, raid, guild, whisper, so it's fun to overhear, not zone-wide spam.)
 
+**Whisper caveat (learned live):** if your playerbots fork also routes LLM replies to whispers, bots
+can end up answering *other bots'* addon-protocol whispers, which spins up an invisible whisper-to-whisper
+loop that quietly floods party chat. If you see that, add `whisper` to `LLMBlockedReplyChannels`. The
+tradeoff: bots then won't LLM-answer your own whispers either, unless your fork separates player whispers
+from addon traffic.
+
+**Log tip:** the shim writes every line it generates to stderr, so capturing the service's stderr gives
+you a full transcript of everything the bots have ever said. Run it under a service manager with output
+rotation (NSSM's `AppStderr` on Windows, or a redirect under systemd) so the archive doesn't grow unbounded.
+
 ## Writing personas
 
 Drop a `personas/<botname>.txt` (lowercase, matching the bot's in-game name) with a short brief.
@@ -156,6 +169,7 @@ Bring your own cast. They're just text files.
 | `SHIM_TOP_P` / `SHIM_TOP_K` | `0.95` / `60` | variety sampling; higher = less repetitive |
 | `SHIM_REPEAT_PENALTY` | `1.15` | penalize repeated tokens (anti-catchphrase) |
 | `SHIM_MEM_TURNS` | `6` | memory depth per (bot, speaker) conversation |
+| `SHIM_KEEP_ALIVE` | `1h` | how long Ollama keeps the model loaded between replies; `-1` pins it, `5m` restores Ollama's default |
 
 (`no_memory` is a per-request JSON field, not an env var; see Per-conversation memory above.)
 
