@@ -81,10 +81,22 @@ _ATTRIB_PREFIX_RE = re.compile(
 _MEMORY_ECHO_RE = re.compile(
     r"""^\s*["'*]*\s*(?:you|they)\s+said\s*[:,]\s*["']*\s*""", re.IGNORECASE)
 
-# dialogue-then-STAGE-DIRECTIONS: `...beggars. " Cast Detect Magic on the surrounding area.`
-# (seen live) -- sentence ends, close-quote, then a capitalized action continuation. Cut back
-# to the sentence end; the tail is narration wearing a trench coat. Legit mid-line quotes survive.
-_TRAILING_ACTION_RE = re.compile(r'([.!?])\s*"\s+[A-Z].*$', re.DOTALL)
+# dialogue-then-STAGE-DIRECTIONS: the trailing attribution tail ('...trouble." He grins and turns
+# away.') -- cut the trailing narration at the closing quote, but ONLY when the tail after the quote
+# READS as third-person narration (a bare He/She/They, or a Name / 'The X' + a speech/emote verb),
+# so a battle cry followed by more dialogue ('"Charge!" The kobolds are coming!') is left whole.
+# The application site (clean()) reverts the cut if it would leave a stub.
+_TRAILING_ACTION_RE = re.compile(
+    r'([.!?,])\s*["”]\s+'
+    r'(?:'
+      r'(?:He|She|They)\b'                          # third-person pronoun opening the tail = narration
+      r'|(?:[A-Z][a-z\']+|The\s+\w+)\s+'            # or a Name / 'The <thing>' + a speech/emote verb
+        r'(?:said|says?|repl(?:y|ies|ied)|grins?|grinned|smirks?|smirked|chuckl(?:es|ed)|'
+        r'laugh(?:s|ed)|sighs?|shrugs?|nods?|mutter(?:s|ed)|whisper(?:s|ed)|shout(?:s|ed)|'
+        r'yell(?:s|ed)|growl(?:s|ed)|answer(?:s|ed)|declar(?:es|ed)|speak(?:s|ing)?|spoke|'
+        r'adds?|added|continu(?:es|ed)|exclaim(?:s|ed)|snarl(?:s|ed)|hiss(?:es|ed))\b'
+    r').*$',
+    re.DOTALL)
 
 # PROMPT-ECHO lines: small models (Fiendish especially) sometimes open by parroting the prompt
 # scaffolding -- seen live, a bot /said "You are a roleplaying character in World of..." in front
