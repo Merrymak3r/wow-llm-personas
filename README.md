@@ -152,10 +152,14 @@ rotation (NSSM's `AppStderr` on Windows, or a redirect under systemd) so the arc
 ## Writing personas
 
 Drop a `personas/<botname>.txt` (lowercase, matching the bot's in-game name) with a short brief.
-Three originals are included: `thorgrim` (gruff dwarf tank), `melwyn` (anxious priest), `pockets`
-(scheming gnome rogue), plus `_template.txt`. ~60-100 words works best; small models drift if you
-over-write it, and the `never break character / replies under 25 words` tail is doing real work.
-Bring your own cast. They're just text files.
+The repo ships a starter cast to show the range: three original archetypes (`thorgrim` a gruff dwarf
+tank, `melwyn` an anxious priest, `pockets` a scheming gnome rogue) plus `_template.txt` to copy, and
+a bench of well-known film/TV/cartoon personalities reimagined as Azeroth adventurers (smooth-talkers,
+menacing tyrants, agents of pure chaos, and more). ~60-170 words works best; small models drift if you
+over-write it, and each file's `STYLE RULES` tail (a hard "Under 25 words" plus a "stay fully in
+character" line) is doing real work. The edgier voices carry their own "never slurs, never cruelty"
+guardrail bullet; keep that in yours if you write in that register. Bring your own cast. They're just
+text files.
 
 ## Config (all env vars, all optional)
 
