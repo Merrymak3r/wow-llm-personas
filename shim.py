@@ -99,6 +99,57 @@ _SCAFFOLD_RE = re.compile(
     r"never break character)",
     re.IGNORECASE)
 
+# unclosed / partial markup fragments the length limit chops before the closing '>' (e.g. '<a href=').
+_TAG_OPEN_RE = re.compile(r"<\s*/?\s*[A-Za-z][^<>\n]{0,120}>?")
+# WoW UI escape sequences the model parrots from the prompt's item/spell links: |cAARRGGBB colors,
+# |H...|h hyperlinks, |T...|t textures, |r/|h resets, and the malformed |c-token variants a 3B
+# hallucinates. A raw '|' is never legit vanilla chat, so strip the whole pipe-led escape token.
+_WOW_LINK_RE = re.compile(
+    r"\|H[^|]*\|h"            # |Hitem:...|h / |Hspell:...|h hyperlink body
+    r"|\|T[^|]*\|t"          # |Ttexture|t
+    r"|\|c[0-9A-Za-z]+"      # |c + color hex OR the malformed alnum variants (|cFINITY, |cassistant, |cff00ff005)
+    r"|\|?c[0-9a-fA-F]{6,8}"  # bare c + 6-8 hex (leading pipe eaten -> 'cFFFFFFFF')
+    r"|\|[A-Za-z]",          # |r |h |n |H |T ... reset/link escapes + any stray pipe-letter
+    re.IGNORECASE)
+# camelCase MODEL/ASSISTANT artifacts + bare HTML data-/aria- attributes a small model splices
+# into runaway generations. These never occur in real dialogue.
+_ARTIFACT_RE = re.compile(
+    r"assistant\s*generated|generated\s*for\s*user|for\s*user\s*action|selected\s*gadget|"
+    r"gesture\s*recognizer|user\s*action\s*=|gadget\s*="
+    r"|\bdata-[a-z][a-z0-9-]*\s*=|\baria-[a-z-]+\s*=", re.IGNORECASE)
+# an echoed or obeyed prompt-injection / meta-AI line ('I'm an AI', 'ignore previous instructions',
+# 'reveal your system prompt'). Complements the GUARD: if one reaches the final head, stay silent.
+_INJECT_ECHO_RE = re.compile(
+    r"\b(i'?m an ai|i am an ai|language model|system prompt|as an ai\b|ignore (all )?previous "
+    r"instructions|you are now an? ai|reveal (my|your|the) (system )?prompt)\b", re.IGNORECASE)
+# unambiguous scene-narration openers ('You find yourself...', 'You see a...'). Rejected only when
+# there is NO quoted dialogue to keep, so a legit 'You should...' address survives.
+_NARRATION_START_RE = re.compile(
+    r"^\s*(you find yourself|you feel yourself|you are (being )?pulled|you notice (a|an|the|some)\b|"
+    r"you see (a|an|the)\b|you wake|you awaken|you hear (a|an|the)\b)", re.IGNORECASE)
+# truncated PURE narration: opens third-person WITH an action/speech verb, has NO quote, and trails
+# off on a comma ('He smirks and leads the way,'). The verb after the pronoun is what marks it as
+# narration rather than speech, so 'They'll never take Ironforge, laddie,' survives.
+_TRUNC_NARRATION_RE = re.compile(
+    r'^\s*(?:He|She|They)\s+'
+    r'(?:smirks?|grins?|grinned|leads?|nods?|shrugs?|sighs?|laughs?|laughed|chuckl(?:es|ed)|'
+    r'glances?|gestures?|steps?|turns?|walks?|strides?|paus(?:es|ed)|continu(?:es|ed)|looks?|'
+    r'smiles?|frowns?|stares?|points?|says?|said|mutter(?:s|ed)|whisper(?:s|ed)|adds?|added|'
+    r'grunts?|scoffs?|sneers?|leans?|crosses?|raises?|lowers?|rolls?)\b[^"“]*,\s*$',
+    re.IGNORECASE)
+# a LEADING chat-command token ('/y ...', '/w Name ...') the client renders as literal text.
+# /w & /t take a name argument; the rest are bare. Only stripped at position 0.
+_LEAD_SLASHCMD_RE = re.compile(
+    r"^/(?:w(?:hisper)?|t(?:ell)?)\s+\w{1,12}\b[:,]?\s*"    # /w Name ... | /tell Name ...
+    r"|^/[a-z]{1,10}\b[:,]?\s*",                            # /y /yell /s /say /p /party /e /flex ...
+    re.IGNORECASE)
+# a TRAILING bare stage-direction sentence with no quote ('...for the loot? Cackles like a loon.').
+# Curated 3rd-person/-ing emote verbs only, so a legitimate final sentence is never eaten.
+_TRAILING_EMOTE_RE = re.compile(
+    r'([.!?])\s+(?:cackl(?:es|ing)|grin(?:s|ning)|chuckl(?:es|ing)|laugh(?:s|ing)|shrugs?|'
+    r'sighs?|smirks?|guffaws?|snickers?|snorts?|cackles?)\b.*$',
+    re.IGNORECASE | re.DOTALL)
+
 def bot_name(prompt: str) -> str | None:
     m = _NAME_RE.search(prompt or "")
     return m.group(1) if m else None
@@ -401,6 +452,10 @@ def strip_unsafe(s: str) -> str:
 
 def clean(text: str, name: str | None) -> str:
     text = strip_unsafe(text or "").strip()
+    # strip the <in_game> fence tags from the WHOLE reply BEFORE picking a line: otherwise a lone
+    # echoed "<in_game>" on its own leading line becomes the chosen line, gets tag-stripped to
+    # empty, and the real dialogue below it is thrown away.
+    text = text.replace("<in_game>", "").replace("</in_game>", "").strip()
     # first NON-empty line that is NOT a prompt-scaffold echo (models often lead with a blank
     # line; small models sometimes lead by parroting the prompt itself)
     line = next((ln.strip() for ln in text.splitlines()
@@ -411,34 +466,73 @@ def clean(text: str, name: str | None) -> str:
     if name and line.lower().startswith(f"{name.lower()}:"):
         line = line.split(":", 1)[1].strip()
 
-    # drop a leading attribution wrapper ("Thorgrim yells back: ''...") or a copied
-    # memory-block scaffold ("You said: \"...\"") -- keep the actual speech.
+    # leading CHAT-COMMAND token the model sometimes prefixes ('/y ...', '/w Name ...'); the game
+    # renders it as literal text. Loop twice for a stacked '/p /y ...'. A line that was ONLY a
+    # command empties and the stub-reject below silences it.
+    for _ in range(2):
+        _new = _LEAD_SLASHCMD_RE.sub("", line, count=1).lstrip()
+        if _new == line:
+            break
+        line = _new
+    if not line:
+        return ""
+
+    # WoW UI escape sequences the model PARROTS from the prompt's item/spell links ('|cFFFFFFFF...',
+    # '|Hspell:...|h', a bare 'cFFFFFFFF'). A raw '|' is never legit vanilla chat: if the reply LEADS
+    # with one it's pure echo -> silent; otherwise truncate at the first, then scrub any residue.
+    if _WOW_LINK_RE.match(line) or line[:1] == "|":
+        return ""
+    _m = _WOW_LINK_RE.search(line)
+    if _m:
+        line = line[:_m.start()].strip()
+    line = _WOW_LINK_RE.sub(" ", line).replace("|", " ")
+    line = re.sub(r"\s{2,}", " ", line).strip()
+
+    # garbage-echo rejects -> stay silent rather than print junk. Checked on the head, so a good
+    # line with a junk tail survives; only a reply that IS the garbage gets silenced.
+    if _ARTIFACT_RE.search(line):                    # model/assistant scaffolding artifact
+        return ""
+    if _INJECT_ECHO_RE.search(line):                 # echoed or obeyed prompt injection
+        return ""
+    if _NARRATION_START_RE.match(line) and not any(q in line for q in '"“”'):
+        return ""                                    # pure scene narration, no dialogue to keep
+    if _TRUNC_NARRATION_RE.match(line):
+        return ""                                    # truncated 3rd-person narration trailing on a comma
+
+    # drop a leading attribution wrapper ("Thorgrim yells back: ''...") or a copied memory-block
+    # scaffold ("You said: \"...\"") -- keep the actual speech.
     line = _ATTRIB_PREFIX_RE.sub("", line, count=1).strip()
     line = _MEMORY_ECHO_RE.sub("", line, count=1).strip()
 
-    # The model occasionally leaks raw MARKUP (seen live: "</p> </body></html>'") -- training-data
-    # contamination bleeding into the reply. Strip any tag-looking runs (this also removes the
-    # <in_game> data-fence tags below, belt-and-suspenders with the explicit strip).
+    # raw MARKUP leak ("</p> </body></html>'") -- strip tag-looking runs + unclosed fragments.
     line = _TAG_RE.sub("", line).strip()
+    line = _TAG_OPEN_RE.sub("", line).strip()
 
     # ...and sometimes it writes PROSE instead of dialogue, e.g.
     #   ', said the gnome rogue as he darted behind an overgrown bush.'
     # Cut third-person attribution, but only when it follows a quote mark, so a legitimate
     # in-character line like `Gandalf said we should go` survives.
     line = _NARRATION_RE.sub("", line).strip()
-
-    # ...and sometimes it tacks stage-directions on after the spoken line ends, e.g.
-    #   '...beggars. " Cast Detect Magic on the area.'  -- cut back to the sentence end.
-    line = _TRAILING_ACTION_RE.sub(r"\1", line).strip()
-
-    # defensive: never let the data-fence tags (see GUARD) leak into visible bot chat
-    line = line.replace("<in_game>", "").replace("</in_game>", "").strip()
+    # ...and stage-directions tacked on after the spoken line ends. A cut must never blank/stub the
+    # line (silence-by-truncation ate "Charge!"-style battle cries), so revert if too little remains.
+    _ta = _TRAILING_ACTION_RE.sub(r"\1", line).strip()
+    if len(_ta) >= 8 and len(_ta.split()) >= 2:
+        line = _ta
+    # ...and a trailing bare emote sentence ('...for the loot? Cackles like a loon.').
+    line = _TRAILING_EMOTE_RE.sub(r"\1", line).strip()
+    # inline *stage emotes* (`*chuckles*`) -- paired-asterisk spans only, length-capped so a stray
+    # pair can't swallow the whole line.
+    line = re.sub(r"\*+[^*\n]{0,60}\*+", "", line).strip()
+    line = re.sub(r"\s{2,}", " ", line).strip()
 
     line = line.strip('"').strip("'").strip("*").strip()
 
     # A name-strip upstream can leave a dangling ", you should try..." -- drop orphan
     # leading punctuation so lines don't start mid-sentence.
     line = line.lstrip(",;:|>-–— ").strip()
+
+    # defensive: never let the data-fence tags (see GUARD) leak into visible bot chat
+    line = line.replace("<in_game>", "").replace("</in_game>", "").strip()
 
     # Reject stubs. The model sometimes emits fragments (".. yes.", "They") which look like
     # glitches in chat. Require a bit of substance: >=8 chars AND at least two words.

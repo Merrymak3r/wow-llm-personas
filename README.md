@@ -93,9 +93,13 @@ by some TTS engines, and
 vanilla WoW can't render them anyway), and rejects sub-stub fragments so a `.. yes.` glitch never
 reaches chat. It also drops a line that just parrots the prompt scaffolding (small models sometimes
 open by reciting `You are a roleplaying character...` straight into /say) and trims stage-directions
-tacked on after the spoken line ends (`"...beggars." Cast Detect Magic on the area.`). Variety
-sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from converging on the same
-catchphrase.
+tacked on after the spoken line ends (`"...beggars." Cast Detect Magic on the area.`). A handful more,
+mostly aimed at what small models parrot: it strips the WoW UI escape codes a model echoes from the
+prompt's item and spell links (`|cFFFFFFFF...`, `|Hitem:...|h`), stays silent on a reply that is itself
+an echoed prompt-injection or meta-AI line (`ignore previous instructions`, `I'm an AI...`) or a raw
+model artifact, drops a leading chat-command token (`/y ...`), and trims bare scene-narration and stray
+`*emote*` spans. Variety sampling (`top_p` / `top_k` / `repeat_penalty`, see Config) keeps replies from
+converging on the same catchphrase.
 
 ## Model choice
 
