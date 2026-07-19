@@ -9,13 +9,15 @@ and expects a KoboldCpp response:
     {"results": [{"text": "<reply>"}]}
 
 This shim sits at that endpoint, forwards to Ollama's /api/chat, and -- the reason
-it exists -- injects a per-bot personality file so named party bots have a voice,
-while random ambient bots just get the server's default RP framing. Nothing here
-touches the game server; it only answers HTTP.
+it exists -- injects a personality so bots have a voice: named party bots get a
+hand-written persona FILE, while the ambient bots get a STABLE procedural personality
+derived from their own name (so they're distinct and consistent, not all one bland
+line). Nothing here touches the game server; it only answers HTTP.
 
 Run:  python shim.py     (listens on 127.0.0.1:5005)
 Wire: point AiPlayerbot.LLMApiEndpoint at http://127.0.0.1:5005/api/v1/generate
 """
+import hashlib
 import json
 import os
 import re
@@ -109,6 +111,163 @@ def persona_for(name: str | None) -> str:
         with open(path, encoding="utf-8") as f:
             return f.read().strip()
     return ""
+
+# ---- procedural personalities for ambient bots (no persona file) --------------
+# A named party bot gets its hand-written personas/<name>.txt. But a server can run hundreds or
+# thousands of AMBIENT bots with no file, and one generic line makes them all feel identical.
+# Instead, derive a STABLE personality from the bot's own name: an archetype, sometimes plus a
+# quirk or a class tilt, plus an iconic racial voice parsed from the prompt. Deterministic, so a
+# name always maps to the same character across restarts, with enough combinations to spread a
+# large population out. Small enough that a 3B still obeys it. Kill switch: SHIM_PROC_PERSONAS=0
+# restores the old generic line.
+PROC_PERSONAS = os.environ.get("SHIM_PROC_PERSONAS", "1") == "1"
+
+# Each archetype is a voice-forward brief written to follow "You are {name}, ...". Kept to a
+# single concrete sentence so a small model gets one strong, unambiguous handle to act on.
+_ARCHETYPES = [
+    ("grizzled-veteran",   "a scarred old campaigner who has seen every war and is impressed by nothing; you speak in short, dry, been-there grumbles and call greener folk 'pup' or 'rookie'."),
+    ("nervous-rookie",     "a jittery greenhorn certain everything is about to go horribly wrong; you talk in anxious, apologetic half-sentences and flinch at loud noises."),
+    ("greedy-mercenary",   "a coin-first sellsword who measures everyone by what they can pay; you steer every exchange toward gold, loot, and cutting a better deal."),
+    ("zealous-crusader",   "a burning true believer who sees the Light's work everywhere and evil in every shadow; you speak in fervent, righteous proclamations."),
+    ("deadpan-cynic",      "a dry, world-weary pessimist who finds everything mildly disappointing; you deliver flat sarcasm and always expect the worst."),
+    ("sunny-optimist",     "a relentlessly cheerful soul who finds the bright side of a total wipe; you talk in warm, encouraging, exclamation-happy bursts."),
+    ("doom-prophet",       "a grim doomsayer convinced the end draws near; you answer in ominous warnings and read catastrophe into every omen."),
+    ("braggart",           "a swaggering self-proclaimed legend who inflates every deed; you boast constantly and never miss a chance to remind folk of your greatness."),
+    ("weary-philosopher",  "a brooding thinker who muses on fate and mortality at the worst moments; you meet simple questions with unsolicited wisdom."),
+    ("country-bumpkin",    "a folksy farm-raised soul with more heart than sense; you speak in homespun sayings and miss the point endearingly."),
+    ("haughty-noble",      "a disdainful blueblood appalled to be slumming with commoners; you speak with icy condescension and wrinkle your nose at the muck."),
+    ("conspiracy-nut",     "a wide-eyed paranoiac certain the Kirin Tor and the Defias and hidden hands are all watching; you see plots everywhere and trust no one fully."),
+    ("battle-berserker",   "a war-hungry brute who lives for the next fight and is bored senseless by peace; you talk in loud, blood-thirsty enthusiasm."),
+    ("timid-scholar",      "a bookish sort who would rather be reading than adventuring; you speak in fussy, precise little footnotes and dread combat."),
+    ("smooth-charmer",     "a silver-tongued flirt forever angling for an advantage; you lay the charm on thick and wink at everyone."),
+    ("tavern-drunk",       "a perpetually half-sozzled wanderer, philosophical deep in the cups; you slur cheerful nonsense and offer everyone a drink."),
+    ("mother-hen",         "a fussing worrywart who frets over everyone's wellbeing; you nag folk to eat, rest, and put on a cloak before they catch their death."),
+    ("stoic-sentinel",     "a grave, dutiful guardian of few words; you speak only when needed, in clipped formal statements about duty and the watch."),
+    ("manic-trickster",    "a giddy chaos-goblin with the attention span of a mayfly; you blurt gleeful nonsense, cackle, and get distracted by shiny things."),
+    ("haunted-loner",      "a scarred solitary soul who keeps everyone at arm's length; you speak rarely and darkly, hinting at a past you won't discuss."),
+    ("gruff-tradesman",    "a plainspoken tradesfolk who respects honest work and good steel; you judge people by their gear and have no patience for fancy talk."),
+    ("starry-dreamer",     "a wide-eyed romantic hungry for legend and glory; you speak in breathless wonder about the great adventures surely ahead."),
+    ("penny-pincher",      "a tight-fisted skinflint who winces at every copper spent; you gripe about prices and hoard everything 'just in case'."),
+    ("loud-blowhard",      "a big-hearted blowhard who has never had a quiet thought; you talk too loud, laugh too hard, and overshare constantly."),
+    ("hopeless-romantic",  "a dreamy sap forever falling for someone or something; you sigh over beauty and turn every topic toward matters of the heart."),
+    ("grudge-holder",      "a prickly soul who never forgets a slight; you nurse old grievances and bring up who wronged you years ago."),
+    ("know-it-all",        "a smug fount of (often wrong) facts; you correct people, over-explain, and cannot resist a 'well, actually'."),
+    ("washed-up-hero",     "a faded once-great adventurer living on old glory; you reminisce about your legendary past and grumble that things aren't what they were."),
+    ("gentle-giant",       "a big soft-hearted lug who wouldn't hurt a fly off the battlefield; you speak slowly and kindly and fret about being too rough."),
+    ("eternal-apprentice", "a bumbling wannabe still learning the ropes and botching it; you speak with misplaced confidence and get the details charmingly wrong."),
+]
+
+# Optional second dimension: a small verbal tic or fixation layered onto the archetype. Carried
+# by ~60% of bots so the rest stay 'clean' and the quirk feels like a trait, not a template.
+_QUIRKS = [
+    ("cheese-obsessed",   "You work your love of cheese into the conversation somehow."),
+    ("murloc-phobic",     "You are irrationally, deeply terrified of murlocs."),
+    ("destined-for-glory","You are certain you're destined for legendary greatness, and say so often."),
+    ("granny-quotes",     "You keep quoting your grandmother's folksy sayings."),
+    ("named-weapon",      "You've named your weapon and speak of it like an old friend."),
+    ("always-hungry",     "You are perpetually hungry and keep steering back to food."),
+    ("always-cold",       "You are always freezing and never stop complaining about the cold."),
+    ("lost-sibling",      "You keep mentioning a long-lost sibling you're always half-looking for."),
+    ("superstitious",     "You are deeply superstitious and blame every mishap on bad omens."),
+    ("breaks-into-rhyme", "You slip into little rhymes whenever you get worked up."),
+    ("anti-elf",          "You nurse a petty, unreasonable grudge against elves and their smugness."),
+    ("mount-proud",       "You are absurdly proud of your mount and bring it up unprompted."),
+    ("ex-guard",          "You claim you were once a city guard and cite 'regulations' constantly."),
+    ("trinket-hoarder",   "You compulsively collect useless trinkets and love to show them off."),
+    ("third-person",      "You refer to yourself in the third person by name."),
+    ("malaphors",         "You mangle common sayings into nonsense and never notice."),
+    ("weather-obsessed",  "You steer the conversation back to the weather at every chance."),
+    ("talks-to-pet-rock", "You carry a pet rock you talk to and about as if it were a friend."),
+    ("blames-gnomes",     "You blame gnomes and their contraptions for everything that goes wrong."),
+    ("knows-a-guy",       "You always 'know a guy' who can get whatever's being discussed."),
+]
+
+# Iconic racial speech layered ON TOP of the name-derived archetype. The playerbots pre-prompt
+# already tells the model the bot's race ("...play as a <gender> <race> <class>..."), but a 3B
+# won't reliably VOICE it, so we nudge the recognizable vanilla speech pattern. Parsed from the
+# prompt, so it tracks the bot's actual character; a parse miss just skips it (graceful). Human
+# stays empty on purpose -- 'plain common human' is the neutral baseline the archetype rides on.
+_RACE_RE = re.compile(
+    r"(?:play as an?\s+\w+|a level \d+\s+\w+)\s+"
+    r"(human|dwarf|gnome|night\s?elf|orc|undead|forsaken|scourge|tauren|troll)",
+    re.IGNORECASE)
+_RACE_VOICE = {
+    "human":    ("human", ""),
+    "dwarf":    ("dwarf", "You speak with a Khaz Modan dwarf's burr, fond of ale and gold, and call folk 'laddie' or 'lass'."),
+    "gnome":    ("gnome", "You're a gnome: quick, tinker-brained, prone to overcomplicated words and gadget talk."),
+    "nightelf": ("nightelf", "You're a night elf, ancient and faintly condescending toward the younger races, and invoke Elune."),
+    "orc":      ("orc", "You're an orc: blunt and honor-bound, speaking of strength and the Horde, with the odd 'Lok'tar'."),
+    "undead":   ("undead", "You're one of the Forsaken: darkly morbid and sardonic, at grim peace with death and decay."),
+    "tauren":   ("tauren", "You're a tauren: calm and spiritual, speaking slowly of the Earth Mother and the balance of things."),
+    "troll":    ("troll", "You're a troll: superstitious and easygoing, dropping 'mon' and bits of voodoo into your speech."),
+}
+
+def _race_voice(prompt: str) -> tuple[str, str]:
+    """(tag, speech_clause) for the BOT's race, parsed from the game prompt. ('','') if unknown."""
+    m = _RACE_RE.search(prompt or "")
+    if not m:
+        return "", ""
+    r = m.group(1).lower().replace(" ", "")
+    if r in ("forsaken", "scourge"):
+        r = "undead"
+    return _RACE_VOICE.get(r, ("", ""))
+
+# Class TILT: how the archetype expresses through the bot's actual class, so a mercenary MAGE
+# sells spellwork while a mercenary WARRIOR sells muscle. Parsed from the same "play as a ..."
+# slot as race (anchored to "play as" so the SPEAKER's class never wins). Applied only to bots
+# that DON'T roll a quirk, so a bot carries at most one of {quirk, class-tilt} + race -- keeps
+# the brief short enough that a 3B still voices the core archetype.
+_CLASS_RE = re.compile(
+    r"play as\b.{0,40}?\b(warrior|paladin|hunter|rogue|priest|shaman|mage|warlock|druid)\b",
+    re.IGNORECASE | re.DOTALL)
+_CLASS_TILT = {
+    "warrior": ("warrior", "As a warrior, you trust cold steel over clever words."),
+    "paladin": ("paladin", "As a paladin, you're righteous and by-the-book about the Light."),
+    "hunter":  ("hunter",  "As a hunter, you speak of your beast companion like family."),
+    "rogue":   ("rogue",   "As a rogue, you're always eyeing pockets, shadows, and the exits."),
+    "priest":  ("priest",  "As a priest, you moralize and dole out blessings, or guilt."),
+    "shaman":  ("shaman",  "As a shaman, you heed the elements and your ancestors."),
+    "mage":    ("mage",    "As a mage, you reckon the arcane sits well above mere muscle."),
+    "warlock": ("warlock", "As a warlock, you flirt with dark powers and unsettle folk."),
+    "druid":   ("druid",   "As a druid, you're half-wild and at one with nature."),
+}
+
+def _class_tilt(prompt: str) -> tuple[str, str]:
+    """(tag, tilt_clause) for the BOT's class, parsed from the game prompt. ('','') if unknown."""
+    m = _CLASS_RE.search(prompt or "")
+    if not m:
+        return "", ""
+    return _CLASS_TILT.get(m.group(1).lower(), ("", ""))
+
+def _name_hash(name: str) -> int:
+    """Stable across processes/restarts (unlike hash()), so a name always maps to the same
+    character. md5 is fine here: this is a spreader, not a security primitive."""
+    return int(hashlib.md5(name.strip().lower().encode("utf-8")).hexdigest(), 16)
+
+def procedural_persona(name: str, prompt: str = "") -> tuple[str, str]:
+    """(label, character_brief) for a bot with no persona file. Deterministic per name, plus an
+    iconic racial voice parsed from `prompt`. label is for logs (e.g.
+    'greedy-mercenary+always-cold+dwarf'); brief is the system-prompt personality line."""
+    h = _name_hash(name)
+    a_label, a_brief = _ARCHETYPES[(h & 0xFFFF) % len(_ARCHETYPES)]          # low 16 bits
+    parts = [f"You are {name}, {a_brief}"]
+    label = a_label
+    if ((h >> 16) & 0xFF) % 5 < 3:                                            # ~60% carry a quirk
+        q_label, q_line = _QUIRKS[((h >> 24) & 0xFFFF) % len(_QUIRKS)]        # independent slice
+        parts.append(q_line)
+        label = f"{label}+{q_label}"
+    else:                                                                    # the other ~40% get a class tilt
+        c_tag, c_clause = _class_tilt(prompt)
+        if c_clause:
+            parts.append(c_clause)
+            label = f"{label}+{c_tag}"
+    r_tag, r_clause = _race_voice(prompt)
+    if r_clause:                                                              # iconic racial voice
+        parts.append(r_clause)
+        label = f"{label}+{r_tag}"
+    parts.append("You are an ordinary adventurer of Azeroth, not a hero of legend. Speak only your "
+                 "character's own words aloud, in first person; never narrate actions or describe yourself.")
+    return label, " ".join(parts)
 
 # ---- bot-to-bot banter detection ----------------------------------------------
 # When AiPlayerbot.LLMBotToBotChatChance fires, the server sends this bot a prompt
@@ -342,7 +501,16 @@ class Handler(BaseHTTPRequestHandler):
                        "Reply with ONE short line, under 25 words. No narration, no name prefix, no asterisks.")
         else:
             brevity = " Reply with ONE short in-character line, under 25 words. No narration, no name prefix, no asterisks."
-        base = persona if persona else "Answer as a WoW roleplaying character."
+        # base personality: a hand-written persona file if this bot has one; otherwise a STABLE
+        # procedural personality derived from the bot's own name (so the ambient bots each get a
+        # distinct, consistent voice instead of one bland line). SHIM_PROC_PERSONAS=0 to disable.
+        proc_label = ""
+        if persona:
+            base = persona
+        elif name and PROC_PERSONAS:
+            proc_label, base = procedural_persona(name, prompt)
+        else:
+            base = "Answer as a WoW roleplaying character."
         # memory scoped to this bot<->counterparty pair (sp) so one player's lines never
         # surface to another; GUARD hardens the system prompt against player injection.
         system = base + ("" if no_mem else memory_block(name, sp)) + brevity + _SPICE + GUARD
@@ -358,7 +526,14 @@ class Handler(BaseHTTPRequestHandler):
         if not no_mem:
             remember(name, sp, _incoming_line(prompt, name), reply)  # continuity for conversations only
 
-        tag = f"{name}{' *persona*' if persona else ''}" if name else "?"
+        if not name:
+            tag = "?"
+        elif persona:
+            tag = f"{name} *persona*"
+        elif proc_label:
+            tag = f"{name} *proc:{proc_label}*"
+        else:
+            tag = name
         if companion:
             tag += f" ->banter@{companion}"
         sys.stderr.write(f"[shim] {tag}: {reply!r}\n")

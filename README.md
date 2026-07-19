@@ -44,8 +44,16 @@ into "a character answered":
 The server's prompt always contains `Your name is <BotName>.`. The shim pulls that name out and, if
 `personas/<name>.txt` exists, loads it as the **system message** (not prepended to the user prompt:
 that's an A/B-proven fix; user-message personas made RP models leak `assistant  Name says:`
-scaffolding). Bots with a persona file speak in character; nameless ambient bots just get the
-server's default framing. Adding a character is dropping in a text file. No code, no restart.
+scaffolding). Bots with a persona file speak in character. Adding a hand-written character is just
+dropping in a text file. No code, no restart.
+
+Bots **without** a file (the ambient crowd, potentially hundreds or thousands of them) don't fall back
+to one bland shared line. They get a **stable procedural personality** derived from their own name: an
+archetype (grizzled veteran, nervous rookie, greedy mercenary, doom-prophet, tavern-drunk, and ~25 more),
+sometimes a small quirk or a class tilt, plus an iconic racial voice parsed from the prompt (a dwarf's
+"laddie", an orc's "Lok'tar", a Forsaken's morbid calm). It's deterministic (`md5(name)`, so the same
+name always maps to the same character across restarts) with enough combinations to keep a big population
+feeling distinct. `SHIM_PROC_PERSONAS=0` reverts the ambient bots to the old generic line.
 
 ### 2. Per-conversation memory
 A small in-process ring buffer (`collections.deque`, `SHIM_MEM_TURNS` turns) so a persona stays
@@ -170,6 +178,7 @@ text files.
 | `SHIM_HOST` / `SHIM_PORT` | `127.0.0.1` / `5005` | where the shim listens |
 | `SHIM_TEMP` | `0.85` | sampling temperature |
 | `SHIM_ADULT` | `1` (on) | in-character profanity / innuendo license; set `0` for a family-friendly server |
+| `SHIM_PROC_PERSONAS` | `1` (on) | give file-less ambient bots a stable name-derived personality; `0` = old generic line |
 | `SHIM_TOP_P` / `SHIM_TOP_K` | `0.95` / `60` | variety sampling; higher = less repetitive |
 | `SHIM_REPEAT_PENALTY` | `1.15` | penalize repeated tokens (anti-catchphrase) |
 | `SHIM_MEM_TURNS` | `6` | memory depth per (bot, speaker) conversation |
